@@ -91,6 +91,29 @@ describe('AnimClip', function () {
 
     });
 
+    describe('#baseSpeed', function () {
+
+        it('defaults to the speed passed to the constructor', function () {
+            expect(animClip.baseSpeed).to.equal(1);
+            const reverseClip = new AnimClip(animClip.track, 0, -2, true, true, { fire: () => {} });
+            expect(reverseClip.baseSpeed).to.equal(-2);
+        });
+
+        it('is kept independent of speed so an external multiplier can be re-applied each frame', function () {
+            animClip.baseSpeed = 2;
+            animClip.speed = -1 * animClip.baseSpeed;
+            expect(animClip.baseSpeed).to.equal(2);
+            expect(animClip.speed).to.equal(-2);
+            expect(animClip.isReverse).to.equal(true);
+
+            // re-applying the multiplier must not compound into the base speed
+            animClip.speed = 1 * animClip.baseSpeed;
+            expect(animClip.baseSpeed).to.equal(2);
+            expect(animClip.speed).to.equal(2);
+        });
+
+    });
+
     describe('#play', function () {
 
         it('plays the clip from the beginning', function () {

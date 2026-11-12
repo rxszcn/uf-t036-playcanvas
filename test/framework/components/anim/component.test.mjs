@@ -4,6 +4,7 @@ import { INTERPOLATION_LINEAR } from '../../../../src/framework/anim/constants.j
 import { ANIM_LAYER_ADDITIVE, ANIM_LAYER_OVERWRITE } from '../../../../src/framework/anim/controller/constants.js';
 import { AnimCurve } from '../../../../src/framework/anim/evaluator/anim-curve.js';
 import { AnimData } from '../../../../src/framework/anim/evaluator/anim-data.js';
+import { AnimEvents } from '../../../../src/framework/anim/evaluator/anim-events.js';
 import { AnimTrack } from '../../../../src/framework/anim/evaluator/anim-track.js';
 import { Entity } from '../../../../src/framework/entity.js';
 import { MeshInstance } from '../../../../src/scene/mesh-instance.js';
@@ -358,6 +359,166 @@ describe('AnimComponent', function () {
             root.anim.assignAnimation('Scale', scaleTrack(['root', 'missing']));
 
             expect(() => app.systems.anim.onAnimationUpdate(0.5)).to.not.throw();
+        });
+    });
+
+    // A component speed and a state speed each carry a sign, and the effective playback direction
+    // is the product of the two. A negative component speed must reverse playback exactly as a
+    // negative state speed does, rather than freezing the clips on their first frame.
+    describe('playback speed sign', function () {
+
+        const duration = 1;
+
+        // a track ramping localScale.x from 0 to 1 over a second with events at 0.25s and 0.75s
+        const speedTrack = () => {
+            const curve = new AnimCurve([{
+                entityPath: ['root'],
+                component: 'entity',
+                propertyPath: ['localScale']
+            }], 0, 0, INTERPOLATION_LINEAR);
+            const animEvents = new AnimEvents([
+                { name: 'early', time: 0.25 },
+                { name: 'late', time: 0.75 }
+            ]);
+            return new AnimTrack(
+                'Speed',
+                duration,
+                [new AnimData(1, [0, 1])],
+                [new AnimData(3, [0, 0, 0, 1, 1, 1])],
+                [curve],
+                animEvents
+            );
+        };
+
+        // builds an anim component whose single state plays the track at stateSpeed, sets the
+        // component to componentSpeed and ticks ten 0.1s frames
+        const buildComponent = (componentSpeed, stateSpeed, loop = true) => {
+            const root = new Entity('root', app);
+            app.root.addChild(root);
+            root.addComponent('anim', { activate: true });
+            root.anim.speed = componentSpeed;
+            root.anim.assignAnimation('State', speedTrack(), undefined, stateSpeed, loop);
+
+            const events = [];
+            root.anim.on('early', () => events.push('early'));
+            root.anim.on('late', () => events.push('late'));
+
+            const scales = [];
+            for (let i = 0; i < 10; i++) {
+                app.systems.anim.onAnimationUpdate(0.1);
+                scales.push(root.getLocalScale().x);
+            }
+
+            const layer = root.anim.baseLayer;
+            const clip = layer._controller.animEvaluator.clips[0];
+            const clipTime = clip.time;
+            const clipSpeed = clip.speed;
+            const isReverse = clip.isReverse;
+            const clipLoop = clip.loop;
+
+            // detach so the component does not keep ticking (and accumulating events) while later
+            // components in the same test are driven
+            root.destroy();
+
+            return {
+                layer,
+                clip,
+                clipTime,
+                clipSpeed,
+                isReverse,
+                clipLoop,
+                events,
+                scales
+            };
+        };
+
+        [
+            { componentSpeed: 1, stateSpeed: 1, reverse: false },
+            { componentSpeed: -1, stateSpeed: 1, reverse: true },
+            { componentSpeed: 1, stateSpeed: -1, reverse: true },
+            { componentSpeed: -1, stateSpeed: -1, reverse: false }
+        ].forEach(({ componentSpeed, stateSpeed, reverse }) => {
+            it(`plays ${reverse ? 'backwards' : 'forwards'} for component speed ${componentSpeed} and state speed ${stateSpeed}`, function () {
+                const { clipSpeed, isReverse, scales } = buildComponent(componentSpeed, stateSpeed);
+
+                // the clip speed is the product of the two signs, so both negative-speed entries
+                // drive the clip through the same reverse code path
+                expect(clipSpeed).to.equal(componentSpeed * stateSpeed);
+                expect(isReverse).to.equal(reverse);
+
+                // a frozen-on-first-frame regression would leave every sample at the start value
+                const startValue = reverse ? 1 : 0;
+                expect(scales[0]).to.be.closeTo(startValue - (reverse ? 0.1 : -0.1), 1e-5);
+                const distinct = new Set(scales.map(v => v.toFixed(5)));
+                expect(distinct.size).to.be.greaterThan(1);
+
+                // the pose moves monotonically in the playback direction
+                for (let i = 1; i < scales.length; i++) {
+                    if (reverse) {
+                        expect(scales[i]).to.be.at.most(scales[i - 1] + 1e-5);
+                    } else {
+                        expect(scales[i]).to.be.at.least(scales[i - 1] - 1e-5);
+                    }
+                }
+            });
+        });
+
+        it('fires animation events while playing in reverse from a negative component speed', function () {
+            const { events } = buildComponent(-1, 1);
+
+            // reverse playback crosses the late (0.75s) event before the early (0.25s) one, and
+            // neither event is skipped
+            expect(events).to.deep.equal(['late', 'early']);
+        });
+
+        it('fires the same events for a negative component speed as for a negative state speed', function () {
+            const componentDriven = buildComponent(-1, 1);
+            const stateDriven = buildComponent(1, -1);
+
+            expect(componentDriven.events).to.deep.equal(stateDriven.events);
+            expect(componentDriven.scales.map(v => Number(v.toFixed(5)))).to.deep.equal(
+                stateDriven.scales.map(v => Number(v.toFixed(5)))
+            );
+        });
+
+        it('clamps a non looping reverse animation at the start instead of freezing on the first frame', function () {
+            const { clipTime, clipLoop, scales, events } = buildComponent(-1, 1, false);
+
+            // it plays backwards from the end of the track and clamps at the start...
+            expect(clipTime).to.be.closeTo(0, 1e-9);
+            expect(clipLoop).to.equal(false);
+            // ...and the poses actually changed along the way, with events firing
+            expect(new Set(scales.map(v => v.toFixed(5))).size).to.be.greaterThan(1);
+            expect(events).to.deep.equal(['late', 'early']);
+        });
+
+        it('reverses immediately when the component speed sign flips at runtime', function () {
+            const root = new Entity('root', app);
+            app.root.addChild(root);
+            root.addComponent('anim', { activate: true });
+            root.anim.assignAnimation('State', speedTrack(), undefined, 1, true);
+
+            for (let i = 0; i < 5; i++) {
+                app.systems.anim.onAnimationUpdate(0.1);
+            }
+            const clip = root.anim.baseLayer._controller.animEvaluator.clips[0];
+            expect(clip.time).to.be.closeTo(0.5, 1e-9);
+            expect(clip.isReverse).to.equal(false);
+
+            root.anim.speed = -1;
+            for (let i = 0; i < 3; i++) {
+                app.systems.anim.onAnimationUpdate(0.1);
+            }
+            expect(clip.isReverse).to.equal(true);
+            expect(clip.time).to.be.closeTo(0.2, 1e-9);
+        });
+
+        it('pauses playback when the component speed is zero', function () {
+            const { clipSpeed, scales } = buildComponent(0, 1);
+            expect(clipSpeed).to.equal(0);
+            // every frame samples the start pose because the clips never advance
+            expect(new Set(scales.map(v => v.toFixed(5))).size).to.equal(1);
+            expect(scales[0]).to.be.closeTo(0, 1e-5);
         });
     });
 });

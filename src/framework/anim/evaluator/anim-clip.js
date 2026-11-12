@@ -37,6 +37,7 @@ class AnimClip {
         this._playing = playing;
         this._time = time;              // play cursor
         this._speed = speed;            // playback speed, may be negative
+        this._baseSpeed = speed;        // state/node speed before the component speed is applied
         this._loop = loop;              // whether to loop
         this._blendWeight = 1.0;        // blend weight 0..1
         this._blendOrder = 0.0;         // blend order relative to other clips
@@ -84,6 +85,22 @@ class AnimClip {
 
     get speed() {
         return this._speed;
+    }
+
+    /**
+     * Sets the playback speed originating from the state graph (the state or blend tree node)
+     * before the owning component's speed multiplier is applied. The controller restores
+     * {@link AnimClip#speed} from this every frame, so runtime changes to the state graph speed and
+     * the component speed combine instead of overwriting each other.
+     *
+     * @type {number}
+     */
+    set baseSpeed(speed) {
+        this._baseSpeed = speed;
+    }
+
+    get baseSpeed() {
+        return this._baseSpeed;
     }
 
     set loop(loop) {

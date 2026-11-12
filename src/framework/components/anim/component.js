@@ -851,7 +851,12 @@ class AnimComponent extends Component {
 
     update(dt) {
         for (let i = 0; i < this.layers.length; i++) {
-            this.layers[i].update(dt * this.speed);
+            const layer = this.layers[i];
+            // propagate the speed sign to the clips instead of scaling the delta time, so a
+            // negative component speed drives reverse playback through the same path as a
+            // negative state speed
+            layer.speed = this._speed;
+            layer.update(dt);
         }
         this._consumedTriggers.forEach((trigger) => {
             this.parameters[trigger].value = false;

@@ -554,4 +554,91 @@ describe('AnimController', function () {
 
     });
 
+    describe('#externalTimeScale', function () {
+
+        const dt = 1 / 16;
+        const duration = 4;
+
+        // a single looping state 'A' playing a track, driven through an external time scale that
+        // carries the AnimComponent speed sign
+        const createController = (externalTimeScale, stateSpeed = 1, loop = true) => {
+            const graph = new Entity();
+            const animBinder = new AnimComponentBinder({ entity: graph }, graph, 'layer', {}, 0);
+            animBinder.resolve = () => {};
+            const states = [
+                { name: 'START' },
+                { name: 'A', speed: stateSpeed, loop },
+                { name: 'B', speed: stateSpeed, loop }
+            ];
+            const transitions = [{ from: 'START', to: 'A' }, { from: 'A', to: 'B', exitTime: 1 }, { from: 'B', to: 'A', exitTime: 1 }];
+            const animController = new AnimController(new AnimEvaluator(animBinder), states, transitions, true, null, () => null, () => {});
+            animController.externalTimeScale = externalTimeScale;
+            const curves = [new AnimCurve(['path/to/entity'], 0, 0, INTERPOLATION_LINEAR)];
+            const inputs = [new AnimData(1, [0, 2, 4])];
+            const outputs = [new AnimData(1, [0, 1, 2])];
+            animController.assignAnimation('A', new AnimTrack('trackA', duration, inputs, outputs, curves));
+            animController.assignAnimation('B', new AnimTrack('trackB', duration, inputs, outputs, curves));
+            animController.play('A');
+            return animController;
+        };
+
+        const updateFrames = (animController, frames) => {
+            for (let i = 0; i < frames; i++) {
+                animController.update(dt);
+            }
+        };
+
+        it('multiplies the external time scale into the active clip speed', function () {
+            const animController = createController(-1, 2);
+            animController.update(dt);
+            expect(animController.animEvaluator.clips[0].speed).to.equal(-2);
+            expect(animController.animEvaluator.clips[0].baseSpeed).to.equal(2);
+        });
+
+        it('plays a positive state speed backwards under a negative external time scale', function () {
+            const animController = createController(-1, 1);
+            const clip = animController.animEvaluator.clips[0];
+            // a reverse playing state starts at the end of its track rather than the start
+            expect(clip.time).to.equal(duration);
+            updateFrames(animController, 4);
+            expect(clip.isReverse).to.equal(true);
+            expect(clip.time).to.be.closeTo(duration - 4 * dt, 1e-9);
+        });
+
+        it('keeps the state time wrapped within the track duration while looping in reverse', function () {
+            const animController = createController(-1, 1, true);
+            updateFrames(animController, duration / dt + 3);
+            expect(animController.activeStateCurrentTime).to.be.at.least(0);
+            expect(animController.activeStateCurrentTime).to.be.at.most(duration);
+        });
+
+        it('transitions on an exit time of 1 once a reverse playing clip has played once', function () {
+            const animController = createController(-1, 1, true);
+            const frames = duration / dt;
+            updateFrames(animController, frames - 1);
+            expect(animController.activeStateName).to.equal('A');
+            updateFrames(animController, 1);
+            expect(animController.activeStateName).to.equal('B');
+        });
+
+        it('clamps a non looping reverse state at the start', function () {
+            const animController = createController(-1, 1, false);
+            updateFrames(animController, duration / dt + 5);
+            const clip = animController.animEvaluator.clips[0];
+            expect(clip.time).to.be.closeTo(0, 1e-9);
+            expect(clip._playing).to.equal(false);
+        });
+
+        it('treats two negative signs as forward playback', function () {
+            const animController = createController(-1, -1, true);
+            const clip = animController.animEvaluator.clips[0];
+            expect(clip.speed).to.equal(1);
+            expect(clip.isReverse).to.equal(false);
+            expect(clip.time).to.equal(0);
+            updateFrames(animController, 4);
+            expect(clip.time).to.be.closeTo(4 * dt, 1e-9);
+        });
+
+    });
+
 });

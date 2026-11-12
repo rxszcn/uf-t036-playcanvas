@@ -105,6 +105,29 @@ class AnimController {
     _timeInStateBefore = 0;
 
     /**
+     * Cumulative, unwrapped playback amount of the active state in seconds, counting up for
+     * forward playback and down for reverse. Unlike {@link AnimController#_timeInState} this does
+     * not wrap, so exit time transitions can be detected across loop boundaries.
+     *
+     * @type {number}
+     * @private
+     */
+    _statePlayback = 0;
+
+    /** @private */
+    _statePlaybackBefore = 0;
+
+    /**
+     * Playback multiplier applied on top of every active state's own speed. This carries the
+     * {@link AnimComponent#speed} sign into the clips, so a negative component speed reverses
+     * playback just as a negative state speed does.
+     *
+     * @type {number}
+     * @private
+     */
+    _externalTimeScale = 1;
+
+    /**
      * Create a new AnimController.
      *
      * @param {AnimEvaluator} animEvaluator - The animation evaluator used to blend all current
@@ -194,6 +217,23 @@ class AnimController {
         return playable;
     }
 
+    /**
+     * Sets the playback multiplier applied on top of the active state's own speed. This is how
+     * the owning {@link AnimComponent} propagates its speed, including a negative one: the sign is
+     * multiplied into each clip's speed so that reverse playback is driven through the same code
+     * path as a negative state speed.
+     *
+     * @type {number}
+     * @ignore
+     */
+    set externalTimeScale(value) {
+        this._externalTimeScale = value;
+    }
+
+    get externalTimeScale() {
+        return this._externalTimeScale;
+    }
+
     set playing(value) {
         this._playing = value;
     }
@@ -224,6 +264,8 @@ class AnimController {
     set activeStateCurrentTime(time) {
         this._timeInStateBefore = time;
         this._timeInState = time;
+        this._statePlaybackBefore = this._activeStateTimeScale < 0 ? -time : time;
+        this._statePlayback = this._statePlaybackBefore;
         for (let i = 0; i < this.activeStateAnimations.length; i++) {
             const clip = this.animEvaluator.findClip(this.activeStateAnimations[i].name);
             if (clip) {
@@ -262,10 +304,11 @@ class AnimController {
     }
 
     /**
-     * The rate at which the time in the active state advances. This is the playback speed of the
-     * state's first clip rather than the state speed, as the two can differ, for example in blend
-     * trees. Exit times, the state progress and the end of non-looping states are then all measured
-     * against what the clip actually plays.
+     * The rate at which the time in the active state advances. This combines the external time
+     * scale (the component speed) with the playback speed of the state's first clip rather than
+     * the state speed, as the two can differ, for example in blend trees. Exit times, the state
+     * progress and the end of non-looping states are then all measured against what the clip
+     * actually plays.
      *
      * @type {number}
      * @private
@@ -273,7 +316,8 @@ class AnimController {
     get _activeStateTimeScale() {
         const animations = this.activeStateAnimations;
         const activeClip = animations.length > 0 ? this._animEvaluator.findClip(animations[0].name) : null;
-        return activeClip ? activeClip.speed : this.activeState.speed;
+        const speed = activeClip ? activeClip.speed : this.activeState.speed;
+        return this._externalTimeScale * speed;
     }
 
     _getActiveStateProgressForTime(time) {
@@ -283,9 +327,9 @@ class AnimController {
 
         const activeClip = this._animEvaluator.findClip(this.activeStateAnimations[0].name);
         if (activeClip) {
-            // the time in state advances at the clip speed, so it is already the clip's playback
-            // time. For a clip playing in reverse it runs from 0 towards negative values.
-            return (activeClip.speed < 0 ? -time : time) / activeClip.track.duration;
+            // the time in state mirrors the clip's playback time within [0, duration], counting down
+            // for reverse playback, so it normalizes directly into progress
+            return time / activeClip.track.duration;
         }
 
         return null;
@@ -384,13 +428,23 @@ class AnimController {
         // when an exit time is present, we should only exit if it falls within the current frame delta time.
         // A transition out of a state without a timeline ignores its exit time, as it could never be met
         if (transition.hasExitTime && hasTimeline(transition.from)) {
-            let progressBefore = this._getActiveStateProgressForTime(this._timeInStateBefore);
-            let progress = this._getActiveStateProgressForTime(this._timeInState);
-            // when the exit time is smaller than 1 and the state is looping, we should check for an exit each loop
+            const activeClip = this._animEvaluator.findClip(this.activeStateAnimations[0].name);
+            const trackDuration = activeClip ? activeClip.track.duration : this.activeStateDuration;
+
+            // express the frame endpoints as a monotonically increasing amount of played progress.
+            // The unwrapped playback amount is signed, so reverse playback is negated, and looping
+            // states take the fractional part to detect an exit on every loop
+            let progressBefore = this._statePlaybackBefore / trackDuration;
+            let progress = this._statePlayback / trackDuration;
+            if (this._activeStateTimeScale < 0) {
+                progressBefore = -progressBefore;
+                progress = -progress;
+            }
             if (transition.exitTime < 1.0 && this.activeState.loop) {
                 progressBefore -= Math.floor(progressBefore);
                 progress -= Math.floor(progress);
             }
+
             // if the delta time is 0 and the progress matches the exit time, the exitTime condition has been met
             if (progress === progressBefore) {
                 if (progress !== transition.exitTime) {
@@ -548,7 +602,9 @@ class AnimController {
         const activeState = this.activeState;
         const hasTransitionOffset = transition.transitionOffset && transition.transitionOffset > 0.0 && transition.transitionOffset < 1.0;
 
-        // set the time in the new state to 0 or to a value based on transitionOffset if one was given
+        // set the time in the new state to 0 or to a value based on transitionOffset if one was
+        // given. A reverse-playing state starts at the end of its timeline so, like the clip's
+        // playback time, it counts down within [0, timelineDuration]
         let timeInState = 0;
         let timeInStateBefore = 0;
         if (hasTransitionOffset) {
@@ -558,8 +614,11 @@ class AnimController {
         }
         this._timeInState = timeInState;
         this._timeInStateBefore = timeInStateBefore;
+        this._statePlayback = 0;
+        this._statePlaybackBefore = 0;
 
         // Add clips to the evaluator for each animation in the new state.
+        let reverseStartTime = 0;
         for (let i = 0; i < activeState.animations.length; i++) {
             clip = this._animEvaluator.findClip(activeState.animations[i].name);
             if (!clip) {
@@ -570,6 +629,9 @@ class AnimController {
             } else {
                 clip.reset();
             }
+            // apply the component speed straight away so a newly entered reverse-playing state
+            // starts at the end of its track instead of wrapping back from the start
+            this._applyExternalTimeScale(clip);
             if (transition.time > 0) {
                 clip.blendWeight = 0.0;
             } else {
@@ -578,11 +640,32 @@ class AnimController {
             clip.play();
             if (hasTransitionOffset) {
                 clip.time = activeState.timelineDuration * transition.transitionOffset;
+            } else if (clip.speed < 0) {
+                clip.time = clip.track.duration;
+                reverseStartTime = Math.max(reverseStartTime, clip.track.duration);
             } else {
-                const startTime = activeState.speed >= 0 ? 0 : this.activeStateDuration;
-                clip.time = startTime;
+                clip.time = 0;
             }
         }
+
+        // keep the state time aligned with where the reverse-playing clips actually start
+        if (!hasTransitionOffset && reverseStartTime > 0) {
+            this._timeInState = reverseStartTime;
+            this._timeInStateBefore = reverseStartTime;
+        }
+    }
+
+    /**
+     * Multiplies the controller's external time scale (the component speed) into a clip's speed,
+     * keeping the state graph speed as its {@link AnimClip#baseSpeed} so the multiplier can be
+     * re-applied every frame without compounding.
+     *
+     * @param {AnimClip} clip - The clip to update.
+     * @private
+     */
+    _applyExternalTimeScale(clip) {
+        clip.baseSpeed = clip.speed;
+        clip.speed = this._externalTimeScale * clip.baseSpeed;
     }
 
     _transitionToState(newStateName) {
@@ -658,6 +741,8 @@ class AnimController {
         this._isTransitioning = false;
         this._timeInState = 0;
         this._timeInStateBefore = 0;
+        this._statePlayback = 0;
+        this._statePlaybackBefore = 0;
         this._animEvaluator.removeClips();
     }
 
@@ -672,17 +757,49 @@ class AnimController {
         let state;
         let animation;
         let clip;
-        // update time when looping or when the active state is not at the end of its duration
-        if (this.activeState.loop || this._timeInState < this.activeStateDuration) {
-            const timeScale = this._activeStateTimeScale;
+
+        // multiply the component speed into every clip so its sign drives the clip's own reverse
+        // playback, looping and event logic rather than arriving as a negative delta time
+        const externalTimeScale = this._externalTimeScale;
+        for (let i = 0; i < this._animEvaluator.clips.length; i++) {
+            clip = this._animEvaluator.clips[i];
+            clip.speed = externalTimeScale * clip.baseSpeed;
+        }
+
+        // the direction in which the active state's time advances this frame
+        const timeScale = this._activeStateTimeScale;
+        const isReverse = timeScale < 0;
+        const duration = this.activeStateDuration;
+
+        // update time when looping or when the active state has not reached the end in its play
+        // direction. The time in state mirrors the clip's playback time, wrapping within
+        // [0, duration] for looping states and clamping at the end otherwise
+        const atDurationEnd = isReverse ? this._timeInState <= 0 : this._timeInState >= duration;
+        if (this.activeState.loop || !atDurationEnd) {
             this._timeInStateBefore = this._timeInState;
+            this._statePlaybackBefore = this._statePlayback;
             this._timeInState += dt * timeScale;
-            // if the active state is not looping and the time in state is greater than the duration, set the time in state to the state duration
-            // and update the delta time accordingly. The time in state advances at the time scale, so divide by it to get back to real time
-            if (!this.activeState.loop && this._timeInState > this.activeStateDuration) {
-                this._timeInState = this.activeStateDuration;
-                dt = (this.activeStateDuration - this._timeInStateBefore) / timeScale;
+            this._statePlayback += dt * timeScale;
+            if (this.activeState.loop && duration > 0) {
+                if (this._timeInState >= duration) {
+                    this._timeInState %= duration;
+                } else if (this._timeInState < 0) {
+                    this._timeInState = duration + (this._timeInState % duration);
+                }
+            } else if (!this.activeState.loop) {
+                // shorten the delta time to what the clip actually plays this frame so transitions
+                // do not advance past the end of a non looping state
+                if (!isReverse && this._timeInState > duration) {
+                    this._timeInState = duration;
+                    dt = (duration - this._timeInStateBefore) / timeScale;
+                } else if (isReverse && this._timeInState < 0) {
+                    this._timeInState = 0;
+                    dt = -this._timeInStateBefore / timeScale;
+                }
             }
+        } else {
+            this._timeInStateBefore = this._timeInState;
+            this._statePlaybackBefore = this._statePlayback;
         }
 
         // transition between states if a transition is available from the active state
@@ -692,7 +809,8 @@ class AnimController {
         }
 
         if (this._isTransitioning) {
-            this._currTransitionTime += dt;
+            // transitions progress in real time, so a negative component speed must not rewind them
+            this._currTransitionTime += Math.abs(dt);
             if (this._currTransitionTime <= this._totalTransitionTime) {
                 const interpolatedTime = this._totalTransitionTime !== 0 ? this._currTransitionTime / this._totalTransitionTime : 1;
                 // while transitioning, set all previous state animations to be weighted by (1.0 - interpolationTime).
@@ -741,7 +859,10 @@ class AnimController {
                     if (clip) {
                         clip.blendWeight = animation.normalizedWeight;
                         if (animation.parent.syncAnimations) {
-                            clip.speed = animation.speed;
+                            // store the synchronized speed as the base speed; the external time scale
+                            // is re-applied to it at the start of this update
+                            clip.baseSpeed = animation.speed;
+                            clip.speed = externalTimeScale * animation.speed;
                         }
                     }
                 }

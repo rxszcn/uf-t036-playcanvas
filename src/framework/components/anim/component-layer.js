@@ -321,6 +321,21 @@ class AnimComponentLayer {
         this._controller.rebind();
     }
 
+    /**
+     * Sets the playback speed multiplier applied on top of the state graph speeds. Unlike baking
+     * the multiplier into the frame delta time, this keeps its sign: a negative value reverses the
+     * layer's clips, mirroring the behavior of a negative state speed.
+     *
+     * @type {number}
+     */
+    set speed(value) {
+        this._controller.externalTimeScale = value;
+    }
+
+    get speed() {
+        return this._controller.externalTimeScale;
+    }
+
     update(dt) {
         if (this._blendTime) {
             if (this._blendTimeElapsed < this._blendTime) {
